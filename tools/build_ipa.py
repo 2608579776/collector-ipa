@@ -237,6 +237,7 @@ def main():
             ok += 1
     print(f"[+] 上传完成 {ok}/{len(files)}")
 
+    print('[*] 等待 workflow 文件同步…'); time.sleep(12)
     trigger(token, owner, args.repo)
     run_id, concl = wait_run(token, owner, args.repo)
     if concl != "success":

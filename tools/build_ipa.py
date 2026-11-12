@@ -37,12 +37,18 @@ def req(url, token=None, method="GET", data=None, raw=False, headers=None):
         body = json.dumps(data).encode()
         h["Content-Type"] = "application/json"
     r = urllib.request.Request(url, data=body, headers=h, method=method)
-    try:
-        with urllib.request.urlopen(r, timeout=120) as resp:
-            b = resp.read()
-            return resp.status, (b if raw else json.loads(b.decode() or "{}"))
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode(errors="ignore")[:400]
+    last = None
+    for attempt in range(6):
+        try:
+            with urllib.request.urlopen(r, timeout=60) as resp:
+                b = resp.read()
+                return resp.status, (b if raw else json.loads(b.decode() or "{}"))
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode(errors="ignore")[:400]
+        except (urllib.error.URLError, ConnectionResetError, TimeoutError, OSError) as e:
+            last = e
+            time.sleep(2 * (attempt + 1))
+    return 0, f"network: {last}"
 
 
 def device_login():
@@ -126,11 +132,17 @@ def list_files(root):
 def put_file(token, owner, repo, path, rel, branch="main", tries=3):
     data = open(path, "rb").read()
     payload = {"message": f"add {rel}", "content": base64.b64encode(data).decode(), "branch": branch}
-    st, d = req(f"{API}/repos/{owner}/{repo}/contents/{urllib.parse.quote(rel)}",
-                token, "PUT", payload)
-    if st in (200, 201):
-        return True
-    print(f"  ! {rel} -> {st} {str(d)[:120]}")
+    # 文件已存在时必须带当前 sha，否则 422
+    st0, d0 = req(f"{API}/repos/{owner}/{repo}/contents/{urllib.parse.quote(rel)}?ref={branch}", token)
+    if st0 == 200 and isinstance(d0, dict) and d0.get("sha"):
+        payload["sha"] = d0["sha"]
+    for i in range(4):
+        st, d = req(f"{API}/repos/{owner}/{repo}/contents/{urllib.parse.quote(rel)}",
+                    token, "PUT", payload)
+        if st in (200, 201):
+            return True
+        print(f"  ! {rel} -> {st} {str(d)[:120]} (retry {i+1})")
+        time.sleep(3)
     return False
 
 
@@ -166,11 +178,24 @@ def download_artifact(token, owner, repo, run_id, outdir="/tmp/ipa_out"):
         print("[-] 没有 artifact"); return None
     art = d["artifacts"][0]
     url = art["archive_download_url"]
-    st, blob = req(url, token, raw=True)
-    if st != 200:
-        print("[-] 下载失败", st, blob); return None
+    # 第一步：带 token 拿 302 Location（不跟随，Azure 不接受 Authorization）
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k): return None
+    opener = urllib.request.build_opener(_NoRedirect)
+    rq = urllib.request.Request(url, headers={"Authorization": "Bearer " + token,
+                                              "Accept": "application/vnd.github+json",
+                                              "User-Agent": UA})
+    loc = None
+    try:
+        loc = opener.open(rq, timeout=60).geturl()
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location")
+    if not loc:
+        print("[-] 拿不到 artifact 重定向"); return None
+    # 第二步：无鉴权下载
     zpath = os.path.join(outdir, "artifact.zip")
-    open(zpath, "wb").write(blob)
+    urllib.request.urlretrieve(loc, zpath)
+    blob = open(zpath, "rb").read()
     print(f"[+] artifact 已下载: {zpath} ({len(blob)} bytes)")
     import zipfile
     with zipfile.ZipFile(zpath) as z:

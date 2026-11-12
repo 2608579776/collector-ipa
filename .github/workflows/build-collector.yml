@@ -1,0 +1,95 @@
+name: Collector · iOS 27 采集端
+
+# 在 GitHub 的 macOS runner 上编译出 unsigned IPA（Windows 上用 AltStore 签名安装）
+# 触发：Actions 页面 → Run workflow；或 push 到 main
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "Bundle ID（默认 com.94zero.collector）"
+        required: false
+        default: "com.94zero.collector"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  BUNDLE_ID: ${{ github.event.inputs.bundle_id || 'com.94zero.collector' }}
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境信息
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | tail -8
+          echo "bundle id = $BUNDLE_ID"
+
+      - name: 定位工程目录
+        id: locate
+        run: |
+          if [ -f collector/project.yml ]; then
+            echo "dir=collector" >> "$GITHUB_OUTPUT"
+          elif [ -f project.yml ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+          else
+            echo "找不到 project.yml（应放在仓库根或 collector/ 子目录）"; exit 1
+          fi
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成工程
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -e
+          xcodegen generate
+          echo "--- scheme ---"
+          xcodebuild -list -project Collector.xcodeproj
+
+      - name: 编译（不签名）
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -e
+          xcodebuild \
+            -project Collector.xcodeproj \
+            -scheme Collector \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build 2>&1 | tail -60
+
+      - name: 打包 IPA
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -e
+          APP="build/Build/Products/Release-iphoneos/Collector.app"
+          test -d "$APP" || { echo "构建产物不存在: $APP"; find build -name "*.app" | head; exit 1; }
+          rm -rf Payload collector-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry collector-unsigned.ipa Payload
+          ls -lh collector-unsigned.ipa
+          echo "BUNDLE_ID=$BUNDLE_ID" > build-info.txt
+          echo "XCODE=$(xcodebuild -version | head -1)" >> build-info.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: collector-unsigned-ipa
+          path: |
+            ${{ steps.locate.outputs.dir }}/collector-unsigned.ipa
+            ${{ steps.locate.outputs.dir }}/build-info.txt
+          retention-days: 7
